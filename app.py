@@ -62,9 +62,7 @@ def _read_df(uploaded, header_row: int, sheet_name: Optional[str]) -> pd.DataFra
 
 # =============== Detect & parse ===============
 def _detect_cols_date_remark(df: pd.DataFrame) -> Dict[str, Optional[str]]:
-    """
-    Why: Hanya deteksi Date & Remark; kolom Credit dipaksa dari -10.
-    """
+    """Why: Hanya deteksi Date & Remark; kolom Amount dipaksa dari -10."""
     found = {"date": None, "remark": None}
     for c in df.columns:
         if found["date"] is None and re.search(r"\b(date|tanggal|tgl|posting date|value date)\b", str(c), re.I):
@@ -73,7 +71,6 @@ def _detect_cols_date_remark(df: pd.DataFrame) -> Dict[str, Optional[str]]:
             found["remark"] = c
         if found["date"] and found["remark"]:
             break
-    # fallback kasar
     if found["date"] is None:
         found["date"] = df.columns[0]
     if found["remark"] is None:
@@ -93,6 +90,7 @@ _ZWSP = "\u200B"
 _MINUS_U = "\u2212"  # minus unicode
 
 def _clean_str(x: str) -> str:
+    # Why: Normalisasi spasi & minus aneh
     x = (x or "").replace(_NBSP, " ").replace(_NNBS, " ").replace(_ZWSP, "")
     x = x.replace(_MINUS_U, "-")
     return x.strip()
@@ -111,7 +109,7 @@ def _parse_one_number(x: str) -> Optional[float]:
     if re.match(r"^\s*-\s*", s): neg = True
     s = re.sub(r"(CR|DR|IDR|RP)", "", up)            # buang label
     s = re.sub(r"[^0-9,\.\-]", "", s)                # sisakan angka/pemisah
-    if s == "" or s in {"-", ".", ",", "-.", "-,"}:  # tidak valid
+    if s == "" or s in {"-", ".", ",", "-.", "-,"}:
         return None
     if "." in s and "," in s:
         last_dot, last_com = s.rfind("."), s.rfind(",")
@@ -151,14 +149,11 @@ def _filter_remark(df: pd.DataFrame, remark_col: str, pattern: str) -> pd.DataFr
 
 # =============== Build outputs ===============
 def _get_credit_col_by_neg10(df: pd.DataFrame) -> str:
-    """
-    Why: Penuhi permintaan: ambil kolom ke-10 dari belakang sebagai sumber Credit.
-    """
     if len(df.columns) < 10:
         raise ValueError(f"Jumlah kolom hanya {len(df.columns)} (< 10). Tidak bisa mengambil kolom ke-10 dari belakang.")
     return df.columns[-10]
 
-def _build_outputs(df: pd.DataFrame, date_col: str, remark_col: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def _build_outputs(df: pd.DataFrame, date_col: str, remark_col: str, remark_mode: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
     credit_col = _get_credit_col_by_neg10(df)
     w = df.copy()
     w["Date"] = _parse_date(w[date_col])
@@ -172,15 +167,22 @@ def _build_outputs(df: pd.DataFrame, date_col: str, remark_col: str) -> Tuple[pd
 
     w = w[w["Date"].notna() & w["Amount"].notna()]
 
-    # Hanya FINON
-    wf = _filter_remark(w, "Remark", r"\bFINON\w*")
+    # Mode remark
+    if remark_mode == "FINON saja":
+        pattern = r"\bFINON\w*"
+    elif remark_mode == "FINIF saja":
+        pattern = r"\bFINIF\w*"
+    else:  # FINON & FINIF
+        pattern = r"\bFIN(?:ON|IF)\w*"
+
+    wf = _filter_remark(w, "Remark", pattern)
 
     rows = wf[["Date", "Remark", "Amount"]].copy()
     grouped = (wf.assign(Date=wf["Date"].dt.date)
                  .groupby("Date", as_index=False)["Amount"]
                  .sum()
                  .rename(columns={"Amount": "TotalAmount"}))
-    return rows, grouped, q
+    return rows, grouped, q, credit_col
 
 
 def _to_csv_bytes(df: pd.DataFrame) -> bytes:
@@ -188,11 +190,12 @@ def _to_csv_bytes(df: pd.DataFrame) -> bytes:
 
 
 # =============== App ===============
-st.set_page_config(page_title="Rekening Koran → FINON → Amount dari kolom -10 (Credit)", page_icon="📄", layout="wide")
-st.title("📄 RK → FINON → Amount dari kolom ke-10 dari belakang (Credit)")
+st.set_page_config(page_title="RK → FINON + FINIF → Amount kolom -10 (Credit)", page_icon="📄", layout="wide")
+st.title("📄 Rekening Koran → FINON + FINIF → Amount dari kolom ke-10 dari belakang")
 
 with st.sidebar:
     header_row = st.radio("Mulai baca dari baris (header):", options=[13, 14], index=0, horizontal=True)
+    remark_mode = st.radio("Filter Remark:", options=["FINON & FINIF", "FINON saja", "FINIF saja"], index=0)
     show_debug = st.checkbox("Tampilkan debug", value=True)
 
 uploaded = st.file_uploader("Unggah Rekening Koran (CSV/XLSX/XLS/XLSB)", type=["csv","xlsx","xls","xlsb"])
@@ -227,28 +230,32 @@ if uploaded is not None:
             remark_col = st.selectbox("Kolom Remark:", options=list(df_raw.columns),
                                       index=list(df_raw.columns).index(picks["remark"]) if picks["remark"] in df_raw.columns else 0)
 
-        rows, grouped, qsample = _build_outputs(df_raw, date_col, remark_col)
+        rows, grouped, qsample, credit_col = _build_outputs(df_raw, date_col, remark_col, remark_mode)
 
-        st.subheader("🔎 Baris FINON (Amount dari kolom -10)")
-        st.dataframe(rows.style.format({"Amount": _fmt_no_dot00}), use_container_width=True, height=380)
+        # Warning jika nama kolom -10 tidak mengandung 'Credit'
+        if not re.search(r"credit", str(credit_col), re.I):
+            st.warning(f"Kolom index -10 bernama '{credit_col}', tidak mengandung kata 'Credit'. Pastikan ini benar.")
 
-        st.subheader("🗓️ Rekap per Tanggal (Amount)")
-        st.dataframe(grouped.style.format({"TotalAmount": _fmt_no_dot00}), use_container_width=True, height=300)
+        st.subheader("🔎 Baris (FINON/FINIF sesuai pilihan)")
+        st.dataframe(rows.assign(Amount=rows["Amount"].map(_fmt_no_dot00)), use_container_width=True, height=380)
+
+        st.subheader("🗓️ Rekap per Tanggal")
+        st.dataframe(grouped.assign(TotalAmount=grouped["TotalAmount"].map(_fmt_no_dot00)), use_container_width=True, height=300)
 
         d1, d2 = st.columns(2)
         with d1:
-            st.download_button("💾 Unduh Baris (CSV, tanpa .00 tampilan)",
+            st.download_button("💾 Unduh Baris (CSV, tanpa .00)",
                                data=_to_csv_bytes(rows.assign(Amount=rows["Amount"].map(_fmt_no_dot00))),
-                               file_name="finon_rows_amount_from_neg10.csv", mime="text/csv")
+                               file_name="rows_finon_finif.csv", mime="text/csv")
         with d2:
-            st.download_button("💾 Unduh Rekap (CSV, tanpa .00 tampilan)",
+            st.download_button("💾 Unduh Rekap (CSV, tanpa .00)",
                                data=_to_csv_bytes(grouped.assign(TotalAmount=grouped["TotalAmount"].map(_fmt_no_dot00))),
-                               file_name="finon_grouped_amount_from_neg10.csv", mime="text/csv")
+                               file_name="grouped_finon_finif.csv", mime="text/csv")
 
         if show_debug:
             st.divider()
             st.markdown("**Debug**")
-            st.write("Nama kolom yang dipakai sebagai Credit (index -10):", _get_credit_col_by_neg10(df_raw))
+            st.write("Kolom sumber Amount (index -10):", credit_col)
             st.dataframe(qsample, use_container_width=True)
 
     except ValueError as e:
@@ -263,4 +270,4 @@ if uploaded is not None:
 else:
     st.info("Unggah file untuk mulai memproses.")
 
-st.caption("Kolom Amount selalu diambil dari kolom ke-10 dari belakang. UI menampilkan tanpa '.00'; perhitungan tetap numeric.")
+st.caption("Filter remark dapat memilih FINON, FINIF, atau keduanya. Amount diambil dari kolom ke-10 dari belakang; tampilan & ekspor tanpa '.00'.")
