@@ -105,13 +105,12 @@ def _to_numeric_credit(series: pd.Series) -> pd.Series:
         return pd.to_numeric(series, errors="coerce")
     s = series.astype(str).str.strip()
     both = s.str.contains(r"\.", na=False) & s.str.contains(r",", na=False)
-    only_comma = ~both & s.str_contains(",", regex=False, na=False) if hasattr(s, "str_contains") else (~both & s.str.contains(",", na=False))
+    only_comma = ~both & s.str.contains(",", na=False)
     a = s[both].str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
     b = s[only_comma].str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
     c = s[~(both | only_comma)].str.replace(r"[^\d.\-]", "", regex=True)
     merged = pd.concat([a, b, c]).sort_index()
     num = pd.to_numeric(merged, errors="coerce")
-    # Penting: round ringan agar 123.0000001 jadi 123; tetap float agar konsisten numeric
     return num.round(2)
 
 def _fmt_amount(x: float) -> str:
@@ -132,10 +131,12 @@ def _build_outputs(df: pd.DataFrame, cols: Dict[str, Optional[str]], remark_patt
     w["__credit"] = _to_numeric_credit(w[cols["credit"]])
     w["__remark"] = w[cols["remark"]].astype(str)
     w = w[w["__date"].notna() & w["__credit"].notna()]
+
+    # HANYA FINON
     wf = _filter_remark(w, "__remark", remark_pattern)
 
     out_rows = wf[["__date", "__remark", "__credit"]].rename(columns={"__date":"Date","__remark":"Remark","__credit":"Amount"}).copy()
-    # Amount tetap numeric; jangan di-cast ke string
+    # Amount tetap numeric
 
     grouped = (wf.assign(Date=wf["__date"].dt.date)
                  .groupby("Date", as_index=False)["__credit"].sum()
@@ -150,12 +151,13 @@ def _to_csv_bytes(df: pd.DataFrame) -> bytes:
 
 # =============== App ===============
 st.set_page_config(page_title="Rekening Koran Parser", page_icon="📄", layout="wide")
-st.title("📄 Rekening Koran Uploader → Filter FINIF/FINON → Group per Tanggal")
+st.title("📄 Rekening Koran Uploader → Filter **FINON** → Group per Tanggal")
 
 with st.sidebar:
     st.markdown("**Pengaturan Pembacaan**")
     header_row = st.radio("Mulai baca dari baris (header):", options=[13, 14], index=0, horizontal=True)
-    remark_pattern = st.text_input("Filter Remark (regex):", value=r"(?:^|\s)(FINIF\w*|FINON\w*)")
+    # Default: hanya FINON
+    remark_pattern = st.text_input("Filter Remark (regex, hanya FINON):", value=r"\bFINON\w*")
     show_debug = st.checkbox("Tampilkan debug info", value=False)
 
 uploaded = st.file_uploader("Unggah Rekening Koran (CSV/XLSX/XLS/XLSB)", type=["csv","xlsx","xls","xlsb"])
@@ -195,14 +197,14 @@ if uploaded is not None:
 
         out_rows, grouped = _build_outputs(df_raw, cols, remark_pattern)
 
-        st.subheader("🔎 Baris Terfilter (FINIF/FINON)")
+        st.subheader("🔎 Baris Terfilter (FINON saja)")
         st.dataframe(
             out_rows.style.format({"Amount": _fmt_amount}),
             use_container_width=True,
             height=380,
         )
 
-        st.subheader("🗓️ Rekap Jumlah per Tanggal (Credit)")
+        st.subheader("🗓️ Rekap Jumlah per Tanggal (Credit, FINON)")
         st.dataframe(
             grouped.style.format({"TotalAmount": _fmt_amount}),
             use_container_width=True,
@@ -212,16 +214,16 @@ if uploaded is not None:
         d1, d2 = st.columns(2)
         with d1:
             st.download_button("💾 Unduh Baris Terfilter (CSV)", data=_to_csv_bytes(out_rows),
-                               file_name="filtered_rows.csv", mime="text/csv")
+                               file_name="filtered_rows_finon.csv", mime="text/csv")
         with d2:
             st.download_button("💾 Unduh Rekap per Tanggal (CSV)", data=_to_csv_bytes(grouped),
-                               file_name="grouped_by_date.csv", mime="text/csv")
+                               file_name="grouped_by_date_finon.csv", mime="text/csv")
 
         if show_debug:
             st.divider()
             st.markdown("**Debug**")
             st.write("Detected columns:", cols)
-            st.write("Dtypes (periksa Amount/TotalAmount numeric):")
+            st.write("Dtypes (pastikan Amount/TotalAmount numeric):")
             st.write(out_rows.dtypes)
             st.write(grouped.dtypes)
             st.dataframe(df_raw.head(30), use_container_width=True, height=260)
@@ -235,4 +237,4 @@ if uploaded is not None:
 else:
     st.info("Unggah file untuk mulai memproses.")
 
-st.caption("Tips: UI menampilkan angka tanpa '.00', tetapi data tetap numeric untuk perhitungan & ekspor.")
+st.caption("UI menampilkan angka tanpa '.00', namun data tetap numeric untuk perhitungan & ekspor.")
