@@ -13,17 +13,15 @@ def _ext(name: str) -> str:
 
 def _need_engine_msg(ext: str) -> str:
     if ext == "xls":
-        return "Missing optional dependency 'xlrd'. Install: `pip install xlrd>=2.0.1`"
+        return "Missing 'xlrd'. Install: pip install xlrd>=2.0.1"
     if ext == "xlsx":
-        return "Missing optional dependency 'openpyxl'. Install: `pip install openpyxl`"
+        return "Missing 'openpyxl'. Install: pip install openpyxl"
     if ext == "xlsb":
-        return "Missing optional dependency 'pyxlsb'. Install: `pip install pyxlsb`"
+        return "Missing 'pyxlsb'. Install: pip install pyxlsb"
     return "Engine not found."
 
 def _ensure_engine(ext: str) -> Optional[str]:
-    """
-    Why: Beri pesan ramah jika lib belum terpasang di environment.
-    """
+    """Why: Tampilkan instruksi jelas bila lib Excel belum terpasang."""
     try:
         if ext == "xlsx":
             import openpyxl  # noqa: F401
@@ -45,7 +43,7 @@ def _excel_sheet_names(uploaded) -> List[str]:
     engine = _ensure_engine(ext)
     if ext in {"xls", "xlsx", "xlsb"} and engine is None:
         raise ImportError(_need_engine_msg(ext))
-    xls = pd.ExcelFile(uploaded, engine=engine)  # engine None=auto; kita supply jika ada
+    xls = pd.ExcelFile(uploaded, engine=engine)
     return xls.sheet_names
 
 def _read_df(uploaded, header_row: int, sheet_name: Optional[str]) -> pd.DataFrame:
@@ -95,24 +93,29 @@ def _detect_cols(df: pd.DataFrame) -> Dict[str, Optional[str]]:
     return found
 
 def _parse_date(s: pd.Series) -> pd.Series:
+    """Why: Robust untuk format campuran; tanpa infer_datetime_format (rawan lintas versi)."""
     s = s.astype(str).str.strip()
     d1 = pd.to_datetime(s, errors="coerce", dayfirst=True)
     d2 = pd.to_datetime(s, errors="coerce", dayfirst=False)
     return d1.fillna(d2) if d1.notna().sum() >= d2.notna().sum() else d2.fillna(d1)
 
 def _to_numeric_credit(series: pd.Series) -> pd.Series:
+    """Why: Dukung 1.234,56 (ID) & 1,234.56 (EN); buang simbol; hasil = numeric (float)."""
     if pd.api.types.is_numeric_dtype(series):
         return pd.to_numeric(series, errors="coerce")
     s = series.astype(str).str.strip()
     both = s.str.contains(r"\.", na=False) & s.str.contains(r",", na=False)
-    only_comma = ~both & s.str.contains(",", na=False)
+    only_comma = ~both & s.str_contains(",", regex=False, na=False) if hasattr(s, "str_contains") else (~both & s.str.contains(",", na=False))
     a = s[both].str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
     b = s[only_comma].str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
     c = s[~(both | only_comma)].str.replace(r"[^\d.\-]", "", regex=True)
     merged = pd.concat([a, b, c]).sort_index()
-    return pd.to_numeric(merged, errors="coerce")
+    num = pd.to_numeric(merged, errors="coerce")
+    # Penting: round ringan agar 123.0000001 jadi 123; tetap float agar konsisten numeric
+    return num.round(2)
 
-def _strip_cents(x: float) -> str:
+def _fmt_amount(x: float) -> str:
+    """Why: Tampilkan tanpa '.00' di UI, tapi data tetap numeric."""
     if pd.isna(x): return ""
     s = f"{float(x):.2f}"
     return s[:-3] if s.endswith(".00") else s.rstrip("0").rstrip(".")
@@ -132,12 +135,13 @@ def _build_outputs(df: pd.DataFrame, cols: Dict[str, Optional[str]], remark_patt
     wf = _filter_remark(w, "__remark", remark_pattern)
 
     out_rows = wf[["__date", "__remark", "__credit"]].rename(columns={"__date":"Date","__remark":"Remark","__credit":"Amount"}).copy()
-    out_rows["Amount"] = out_rows["Amount"].map(_strip_cents)
+    # Amount tetap numeric; jangan di-cast ke string
 
     grouped = (wf.assign(Date=wf["__date"].dt.date)
                  .groupby("Date", as_index=False)["__credit"].sum()
                  .rename(columns={"__credit":"TotalAmount"}))
-    grouped["TotalAmount"] = grouped["TotalAmount"].map(_strip_cents)
+    # TotalAmount tetap numeric
+
     return out_rows, grouped
 
 def _to_csv_bytes(df: pd.DataFrame) -> bytes:
@@ -192,10 +196,18 @@ if uploaded is not None:
         out_rows, grouped = _build_outputs(df_raw, cols, remark_pattern)
 
         st.subheader("🔎 Baris Terfilter (FINIF/FINON)")
-        st.dataframe(out_rows, use_container_width=True, height=380)
+        st.dataframe(
+            out_rows.style.format({"Amount": _fmt_amount}),
+            use_container_width=True,
+            height=380,
+        )
 
         st.subheader("🗓️ Rekap Jumlah per Tanggal (Credit)")
-        st.dataframe(grouped, use_container_width=True, height=300)
+        st.dataframe(
+            grouped.style.format({"TotalAmount": _fmt_amount}),
+            use_container_width=True,
+            height=300,
+        )
 
         d1, d2 = st.columns(2)
         with d1:
@@ -209,6 +221,9 @@ if uploaded is not None:
             st.divider()
             st.markdown("**Debug**")
             st.write("Detected columns:", cols)
+            st.write("Dtypes (periksa Amount/TotalAmount numeric):")
+            st.write(out_rows.dtypes)
+            st.write(grouped.dtypes)
             st.dataframe(df_raw.head(30), use_container_width=True, height=260)
 
     except ImportError as e:
@@ -220,4 +235,4 @@ if uploaded is not None:
 else:
     st.info("Unggah file untuk mulai memproses.")
 
-st.caption("Tips: Jika kolom tidak terdeteksi benar, ubah baris header (13/14) atau pilih manual di dropdown.")
+st.caption("Tips: UI menampilkan angka tanpa '.00', tetapi data tetap numeric untuk perhitungan & ekspor.")
