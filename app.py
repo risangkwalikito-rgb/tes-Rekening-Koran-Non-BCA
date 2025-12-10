@@ -7,7 +7,7 @@ import pandas as pd
 import streamlit as st
 
 
-# =============== Utils: Engines & IO ===============
+# ================= IO helpers =================
 def _ext(name: str) -> str:
     return (name or "").lower().rsplit(".", 1)[-1] if "." in (name or "") else ""
 
@@ -21,7 +21,6 @@ def _need_engine_msg(ext: str) -> str:
     return "Engine not found."
 
 def _ensure_engine(ext: str) -> Optional[str]:
-    """Why: Tampilkan instruksi jelas bila lib Excel belum terpasang."""
     try:
         if ext == "xlsx":
             import openpyxl  # noqa: F401
@@ -61,7 +60,7 @@ def _read_df(uploaded, header_row: int, sheet_name: Optional[str]) -> pd.DataFra
     return df
 
 
-# =============== Detect & Parse ===============
+# ================= Detect & parse =================
 def _detect_cols(df: pd.DataFrame) -> Dict[str, Optional[str]]:
     catalog = {
         "date": ["date", "transaction date", "tanggal", "tgl", "posting date", "value date"],
@@ -93,14 +92,12 @@ def _detect_cols(df: pd.DataFrame) -> Dict[str, Optional[str]]:
     return found
 
 def _parse_date(s: pd.Series) -> pd.Series:
-    """Why: Robust untuk format campuran; tanpa infer_datetime_format (rawan lintas versi)."""
     s = s.astype(str).str.strip()
     d1 = pd.to_datetime(s, errors="coerce", dayfirst=True)
     d2 = pd.to_datetime(s, errors="coerce", dayfirst=False)
     return d1.fillna(d2) if d1.notna().sum() >= d2.notna().sum() else d2.fillna(d1)
 
 def _to_numeric_credit(series: pd.Series) -> pd.Series:
-    """Why: Dukung 1.234,56 (ID) & 1,234.56 (EN); buang simbol; hasil = numeric (float)."""
     if pd.api.types.is_numeric_dtype(series):
         return pd.to_numeric(series, errors="coerce")
     s = series.astype(str).str.strip()
@@ -110,11 +107,9 @@ def _to_numeric_credit(series: pd.Series) -> pd.Series:
     b = s[only_comma].str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
     c = s[~(both | only_comma)].str.replace(r"[^\d.\-]", "", regex=True)
     merged = pd.concat([a, b, c]).sort_index()
-    num = pd.to_numeric(merged, errors="coerce")
-    return num.round(2)
+    return pd.to_numeric(merged, errors="coerce").round(2)
 
-def _fmt_amount(x: float) -> str:
-    """Why: Tampilkan tanpa '.00' di UI, tapi data tetap numeric."""
+def _no_trailing_zeros(x: float) -> str:
     if pd.isna(x): return ""
     s = f"{float(x):.2f}"
     return s[:-3] if s.endswith(".00") else s.rstrip("0").rstrip(".")
@@ -127,36 +122,38 @@ def _build_outputs(df: pd.DataFrame, cols: Dict[str, Optional[str]], remark_patt
     if not cols["date"] or not cols["remark"] or not cols["credit"]:
         raise ValueError("Kolom Date/Tanggal, Remark, atau Credit tidak ditemukan. Coba atur header (13/14) atau pilih manual.")
     w = df.copy()
-    w["__date"] = _parse_date(w[cols["date"]])
-    w["__credit"] = _to_numeric_credit(w[cols["credit"]])
-    w["__remark"] = w[cols["remark"]].astype(str)
-    w = w[w["__date"].notna() & w["__credit"].notna()]
+    w["Date"] = _parse_date(w[cols["date"]])
+    w["Remark"] = w[cols["remark"]].astype(str)
+    # UBAH kolom Credit → Amount (numeric internal)
+    w["Amount"] = _to_numeric_credit(w[cols["credit"]])
 
-    # HANYA FINON
-    wf = _filter_remark(w, "__remark", remark_pattern)
+    w = w[w["Date"].notna() & w["Amount"].notna()]
+    wf = _filter_remark(w, "Remark", remark_pattern)
 
-    out_rows = wf[["__date", "__remark", "__credit"]].rename(columns={"__date":"Date","__remark":"Remark","__credit":"Amount"}).copy()
-    # Amount tetap numeric
+    # Output rows (Amount tetap numeric; untuk display/ekspor kita format tanpa .00)
+    out_rows = wf[["Date", "Remark", "Amount"]].copy()
 
-    grouped = (wf.assign(Date=wf["__date"].dt.date)
-                 .groupby("Date", as_index=False)["__credit"].sum()
-                 .rename(columns={"__credit":"TotalAmount"}))
-    # TotalAmount tetap numeric
-
+    # Group by date only (tanggal)
+    grouped = (
+        wf.assign(Date=wf["Date"].dt.date)
+          .groupby("Date", as_index=False)["Amount"]
+          .sum()
+          .rename(columns={"Amount": "TotalAmount"})
+    )
     return out_rows, grouped
 
 def _to_csv_bytes(df: pd.DataFrame) -> bytes:
     buf = io.StringIO(); df.to_csv(buf, index=False); return buf.getvalue().encode("utf-8")
 
 
-# =============== App ===============
+# ================= App =================
 st.set_page_config(page_title="Rekening Koran Parser", page_icon="📄", layout="wide")
-st.title("📄 Rekening Koran Uploader → Filter **FINON** → Group per Tanggal")
+st.title("📄 Rekening Koran → FINON → Amount tanpa .00")
 
 with st.sidebar:
     st.markdown("**Pengaturan Pembacaan**")
     header_row = st.radio("Mulai baca dari baris (header):", options=[13, 14], index=0, horizontal=True)
-    # Default: hanya FINON
+    # Sesuai permintaan: hanya FINON
     remark_pattern = st.text_input("Filter Remark (regex, hanya FINON):", value=r"\bFINON\w*")
     show_debug = st.checkbox("Tampilkan debug info", value=False)
 
@@ -183,6 +180,7 @@ if uploaded is not None:
         df_raw = _read_df(uploaded, header_row=header_row, sheet_name=sheet_name)
         st.success(f"Data terbaca. Baris: {len(df_raw):,} | Kolom: {len(df_raw.columns)}")
 
+        # Detect & let user confirm
         cols = _detect_cols(df_raw)
         c1, c2, c3 = st.columns(3)
         with c1:
@@ -192,49 +190,51 @@ if uploaded is not None:
             cols["remark"] = st.selectbox("Kolom Remark:", options=list(df_raw.columns),
                                           index=list(df_raw.columns).index(cols["remark"]) if cols["remark"] in df_raw.columns else 0)
         with c3:
-            cols["credit"] = st.selectbox("Kolom Credit:", options=list(df_raw.columns),
+            # Label jelas: ini akan dinamai Amount
+            cols["credit"] = st.selectbox("Kolom Credit → akan jadi 'Amount':", options=list(df_raw.columns),
                                           index=list(df_raw.columns).index(cols["credit"]) if cols["credit"] in df_raw.columns else 0)
 
         out_rows, grouped = _build_outputs(df_raw, cols, remark_pattern)
 
-        st.subheader("🔎 Baris Terfilter (FINON saja)")
-        st.dataframe(
-            out_rows.style.format({"Amount": _fmt_amount}),
-            use_container_width=True,
-            height=380,
-        )
+        # ===== Display tanpa .00 =====
+        out_rows_display = out_rows.copy()
+        out_rows_display["Amount"] = out_rows_display["Amount"].map(_no_trailing_zeros)
 
-        st.subheader("🗓️ Rekap Jumlah per Tanggal (Credit, FINON)")
-        st.dataframe(
-            grouped.style.format({"TotalAmount": _fmt_amount}),
-            use_container_width=True,
-            height=300,
-        )
+        grouped_display = grouped.copy()
+        grouped_display["TotalAmount"] = grouped_display["TotalAmount"].map(_no_trailing_zeros)
 
+        st.subheader("🔎 Baris FINON (Amount tanpa .00)")
+        st.dataframe(out_rows_display, use_container_width=True, height=380)
+
+        st.subheader("🗓️ Rekap Jumlah per Tanggal (Amount tanpa .00)")
+        st.dataframe(grouped_display, use_container_width=True, height=300)
+
+        # ===== Download: hapus .00 di file =====
         d1, d2 = st.columns(2)
         with d1:
-            st.download_button("💾 Unduh Baris Terfilter (CSV)", data=_to_csv_bytes(out_rows),
+            st.download_button("💾 Unduh Baris FINON (CSV, tanpa .00)",
+                               data=_to_csv_bytes(out_rows_display),
                                file_name="filtered_rows_finon.csv", mime="text/csv")
         with d2:
-            st.download_button("💾 Unduh Rekap per Tanggal (CSV)", data=_to_csv_bytes(grouped),
+            st.download_button("💾 Unduh Rekap per Tanggal (CSV, tanpa .00)",
+                               data=_to_csv_bytes(grouped_display),
                                file_name="grouped_by_date_finon.csv", mime="text/csv")
 
         if show_debug:
             st.divider()
             st.markdown("**Debug**")
             st.write("Detected columns:", cols)
-            st.write("Dtypes (pastikan Amount/TotalAmount numeric):")
+            st.write("Dtypes internal (Amount numeric):")
             st.write(out_rows.dtypes)
-            st.write(grouped.dtypes)
             st.dataframe(df_raw.head(30), use_container_width=True, height=260)
 
     except ImportError as e:
         st.error(f"Gagal memproses file: {e}")
-        st.info("Solusi cepat: install dependency sesuai tipe file.")
-        st.code("pip install pandas openpyxl xlrd pyxlsb", language="bash")
+        st.info("Install dependency sesuai tipe file:")
+        st.code("pip install pandas streamlit openpyxl xlrd pyxlsb", language="bash")
     except Exception as e:
         st.error(f"Gagal memproses file: {e}")
 else:
     st.info("Unggah file untuk mulai memproses.")
 
-st.caption("UI menampilkan angka tanpa '.00', namun data tetap numeric untuk perhitungan & ekspor.")
+st.caption("Kolom Credit diubah menjadi 'Amount'. Tampilan & ekspor menghilangkan akhiran '.00'.")
