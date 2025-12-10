@@ -7,7 +7,7 @@ import pandas as pd
 import streamlit as st
 
 
-# ================= IO helpers =================
+# =============== IO helpers ===============
 def _ext(name: str) -> str:
     return (name or "").lower().rsplit(".", 1)[-1] if "." in (name or "") else ""
 
@@ -60,35 +60,24 @@ def _read_df(uploaded, header_row: int, sheet_name: Optional[str]) -> pd.DataFra
     return df
 
 
-# ================= Detect & parse =================
-def _detect_cols(df: pd.DataFrame) -> Dict[str, Optional[str]]:
-    catalog = {
-        "date": ["date", "transaction date", "tanggal", "tgl", "posting date", "value date"],
-        "remark": ["remark", "description", "descriptions", "keterangan", "uraian", "transaksi", "details", "detail"],
-        "credit": [
-            "credit", "kredit", "cr", "cr.", "amount credit", "credit amount",
-            "kredit (cr)", "jumlah kredit", "masuk", "in", "deposit", "setoran"
-        ],
-    }
-    low = {c.lower().strip(): c for c in df.columns}
-    found = {"date": None, "remark": None, "credit": None}
-    for k, names in catalog.items():
-        for n in names:
-            if n in low:
-                found[k] = low[n]; break
-    if not found["date"]:
-        for c in df.columns:
-            if re.search(r"\b(date|tanggal|tgl)\b", str(c), re.I): found["date"]=c; break
-    if not found["remark"]:
-        for c in df.columns:
-            if re.search(r"remark|ket|descrip|uraian|detail|transaksi", str(c), re.I): found["remark"]=c; break
-    if not found["credit"]:
-        cand = [c for c in df.columns if re.search(r"cred|kred|(^cr\.?$)|masuk|deposit|setoran|\bin\b", str(c), re.I)]
-        found["credit"] = cand[0] if cand else None
-        if not found["credit"]:
-            for c in df.columns:
-                if pd.api.types.is_numeric_dtype(df[c]) and not re.search(r"debit|dr|balance|saldo", str(c), re.I):
-                    found["credit"] = c; break
+# =============== Detect & parse ===============
+def _detect_cols_date_remark(df: pd.DataFrame) -> Dict[str, Optional[str]]:
+    """
+    Why: Hanya deteksi Date & Remark; kolom Credit dipaksa dari -10.
+    """
+    found = {"date": None, "remark": None}
+    for c in df.columns:
+        if found["date"] is None and re.search(r"\b(date|tanggal|tgl|posting date|value date)\b", str(c), re.I):
+            found["date"] = c
+        if found["remark"] is None and re.search(r"remark|ket|descrip|uraian|detail|transaksi", str(c), re.I):
+            found["remark"] = c
+        if found["date"] and found["remark"]:
+            break
+    # fallback kasar
+    if found["date"] is None:
+        found["date"] = df.columns[0]
+    if found["remark"] is None:
+        found["remark"] = df.columns[1] if len(df.columns) > 1 else df.columns[0]
     return found
 
 def _parse_date(s: pd.Series) -> pd.Series:
@@ -97,19 +86,60 @@ def _parse_date(s: pd.Series) -> pd.Series:
     d2 = pd.to_datetime(s, errors="coerce", dayfirst=False)
     return d1.fillna(d2) if d1.notna().sum() >= d2.notna().sum() else d2.fillna(d1)
 
-def _to_numeric_credit(series: pd.Series) -> pd.Series:
-    if pd.api.types.is_numeric_dtype(series):
-        return pd.to_numeric(series, errors="coerce")
-    s = series.astype(str).str.strip()
-    both = s.str.contains(r"\.", na=False) & s.str.contains(r",", na=False)
-    only_comma = ~both & s.str.contains(",", na=False)
-    a = s[both].str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
-    b = s[only_comma].str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
-    c = s[~(both | only_comma)].str.replace(r"[^\d.\-]", "", regex=True)
-    merged = pd.concat([a, b, c]).sort_index()
-    return pd.to_numeric(merged, errors="coerce").round(2)
+# --- Parser angka super-robust (per-sel) ---
+_NBSP = "\u00A0"
+_NNBS = "\u202F"
+_ZWSP = "\u200B"
+_MINUS_U = "\u2212"  # minus unicode
 
-def _no_trailing_zeros(x: float) -> str:
+def _clean_str(x: str) -> str:
+    x = (x or "").replace(_NBSP, " ").replace(_NNBS, " ").replace(_ZWSP, "")
+    x = x.replace(_MINUS_U, "-")
+    return x.strip()
+
+def _parse_one_number(x: str) -> Optional[float]:
+    if x is None:
+        return None
+    s0 = str(x)
+    s = _clean_str(s0)
+    if s == "":
+        return None
+    up = s.upper()
+    neg = False
+    if "(" in up and ")" in up: neg = True
+    if " DR" in f" {up}" or up.endswith("DR"): neg = True
+    if re.match(r"^\s*-\s*", s): neg = True
+    s = re.sub(r"(CR|DR|IDR|RP)", "", up)            # buang label
+    s = re.sub(r"[^0-9,\.\-]", "", s)                # sisakan angka/pemisah
+    if s == "" or s in {"-", ".", ",", "-.", "-,"}:  # tidak valid
+        return None
+    if "." in s and "," in s:
+        last_dot, last_com = s.rfind("."), s.rfind(",")
+        normalized = s.replace(".", "") if last_dot < last_com else s.replace(",", "")
+        if last_com > last_dot:
+            normalized = normalized.replace(",", ".")
+    else:
+        if "," in s and "." not in s:
+            tail = s.split(",")[-1]
+            normalized = s.replace(",", ".") if 1 <= len(tail) <= 2 else s.replace(",", "")
+        elif "." in s and "," not in s:
+            tail = s.split(".")[-1]
+            normalized = s if 1 <= len(tail) <= 2 else s.replace(".", "")
+        else:
+            normalized = s
+    try:
+        val = float(normalized)
+    except Exception:
+        return None
+    if neg: val = -abs(val)
+    return round(val, 2)
+
+def _to_numeric_amount(series: pd.Series) -> pd.Series:
+    if pd.api.types.is_numeric_dtype(series):
+        return pd.to_numeric(series, errors="coerce").round(2)
+    return series.apply(_parse_one_number)
+
+def _fmt_no_dot00(x: float) -> str:
     if pd.isna(x): return ""
     s = f"{float(x):.2f}"
     return s[:-3] if s.endswith(".00") else s.rstrip("0").rstrip(".")
@@ -118,44 +148,52 @@ def _filter_remark(df: pd.DataFrame, remark_col: str, pattern: str) -> pd.DataFr
     rgx = re.compile(pattern, re.I)
     return df[df[remark_col].astype(str).str.contains(rgx, na=False)].copy()
 
-def _build_outputs(df: pd.DataFrame, cols: Dict[str, Optional[str]], remark_pattern: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    if not cols["date"] or not cols["remark"] or not cols["credit"]:
-        raise ValueError("Kolom Date/Tanggal, Remark, atau Credit tidak ditemukan. Coba atur header (13/14) atau pilih manual.")
+
+# =============== Build outputs ===============
+def _get_credit_col_by_neg10(df: pd.DataFrame) -> str:
+    """
+    Why: Penuhi permintaan: ambil kolom ke-10 dari belakang sebagai sumber Credit.
+    """
+    if len(df.columns) < 10:
+        raise ValueError(f"Jumlah kolom hanya {len(df.columns)} (< 10). Tidak bisa mengambil kolom ke-10 dari belakang.")
+    return df.columns[-10]
+
+def _build_outputs(df: pd.DataFrame, date_col: str, remark_col: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    credit_col = _get_credit_col_by_neg10(df)
     w = df.copy()
-    w["Date"] = _parse_date(w[cols["date"]])
-    w["Remark"] = w[cols["remark"]].astype(str)
-    # UBAH kolom Credit → Amount (numeric internal)
-    w["Amount"] = _to_numeric_credit(w[cols["credit"]])
+    w["Date"] = _parse_date(w[date_col])
+    w["Remark"] = w[remark_col].astype(str)
+    w["Amount"] = _to_numeric_amount(w[credit_col])   # paksa ambil dari kolom -10
+
+    # Debug sample
+    q = pd.DataFrame({"credit_col_name": [credit_col]*10,
+                      "raw_credit": w[credit_col].head(10),
+                      "parsed_amount": w["Amount"].head(10)})
 
     w = w[w["Date"].notna() & w["Amount"].notna()]
-    wf = _filter_remark(w, "Remark", remark_pattern)
 
-    # Output rows (Amount tetap numeric; untuk display/ekspor kita format tanpa .00)
-    out_rows = wf[["Date", "Remark", "Amount"]].copy()
+    # Hanya FINON
+    wf = _filter_remark(w, "Remark", r"\bFINON\w*")
 
-    # Group by date only (tanggal)
-    grouped = (
-        wf.assign(Date=wf["Date"].dt.date)
-          .groupby("Date", as_index=False)["Amount"]
-          .sum()
-          .rename(columns={"Amount": "TotalAmount"})
-    )
-    return out_rows, grouped
+    rows = wf[["Date", "Remark", "Amount"]].copy()
+    grouped = (wf.assign(Date=wf["Date"].dt.date)
+                 .groupby("Date", as_index=False)["Amount"]
+                 .sum()
+                 .rename(columns={"Amount": "TotalAmount"}))
+    return rows, grouped, q
+
 
 def _to_csv_bytes(df: pd.DataFrame) -> bytes:
     buf = io.StringIO(); df.to_csv(buf, index=False); return buf.getvalue().encode("utf-8")
 
 
-# ================= App =================
-st.set_page_config(page_title="Rekening Koran Parser", page_icon="📄", layout="wide")
-st.title("📄 Rekening Koran → FINON → Amount tanpa .00")
+# =============== App ===============
+st.set_page_config(page_title="Rekening Koran → FINON → Amount dari kolom -10 (Credit)", page_icon="📄", layout="wide")
+st.title("📄 RK → FINON → Amount dari kolom ke-10 dari belakang (Credit)")
 
 with st.sidebar:
-    st.markdown("**Pengaturan Pembacaan**")
     header_row = st.radio("Mulai baca dari baris (header):", options=[13, 14], index=0, horizontal=True)
-    # Sesuai permintaan: hanya FINON
-    remark_pattern = st.text_input("Filter Remark (regex, hanya FINON):", value=r"\bFINON\w*")
-    show_debug = st.checkbox("Tampilkan debug info", value=False)
+    show_debug = st.checkbox("Tampilkan debug", value=True)
 
 uploaded = st.file_uploader("Unggah Rekening Koran (CSV/XLSX/XLS/XLSB)", type=["csv","xlsx","xls","xlsb"])
 
@@ -180,54 +218,42 @@ if uploaded is not None:
         df_raw = _read_df(uploaded, header_row=header_row, sheet_name=sheet_name)
         st.success(f"Data terbaca. Baris: {len(df_raw):,} | Kolom: {len(df_raw.columns)}")
 
-        # Detect & let user confirm
-        cols = _detect_cols(df_raw)
-        c1, c2, c3 = st.columns(3)
+        picks = _detect_cols_date_remark(df_raw)
+        c1, c2 = st.columns(2)
         with c1:
-            cols["date"] = st.selectbox("Kolom Date/Tanggal:", options=list(df_raw.columns),
-                                        index=list(df_raw.columns).index(cols["date"]) if cols["date"] in df_raw.columns else 0)
+            date_col = st.selectbox("Kolom Date/Tanggal:", options=list(df_raw.columns),
+                                    index=list(df_raw.columns).index(picks["date"]) if picks["date"] in df_raw.columns else 0)
         with c2:
-            cols["remark"] = st.selectbox("Kolom Remark:", options=list(df_raw.columns),
-                                          index=list(df_raw.columns).index(cols["remark"]) if cols["remark"] in df_raw.columns else 0)
-        with c3:
-            # Label jelas: ini akan dinamai Amount
-            cols["credit"] = st.selectbox("Kolom Credit → akan jadi 'Amount':", options=list(df_raw.columns),
-                                          index=list(df_raw.columns).index(cols["credit"]) if cols["credit"] in df_raw.columns else 0)
+            remark_col = st.selectbox("Kolom Remark:", options=list(df_raw.columns),
+                                      index=list(df_raw.columns).index(picks["remark"]) if picks["remark"] in df_raw.columns else 0)
 
-        out_rows, grouped = _build_outputs(df_raw, cols, remark_pattern)
+        rows, grouped, qsample = _build_outputs(df_raw, date_col, remark_col)
 
-        # ===== Display tanpa .00 =====
-        out_rows_display = out_rows.copy()
-        out_rows_display["Amount"] = out_rows_display["Amount"].map(_no_trailing_zeros)
+        st.subheader("🔎 Baris FINON (Amount dari kolom -10)")
+        st.dataframe(rows.style.format({"Amount": _fmt_no_dot00}), use_container_width=True, height=380)
 
-        grouped_display = grouped.copy()
-        grouped_display["TotalAmount"] = grouped_display["TotalAmount"].map(_no_trailing_zeros)
+        st.subheader("🗓️ Rekap per Tanggal (Amount)")
+        st.dataframe(grouped.style.format({"TotalAmount": _fmt_no_dot00}), use_container_width=True, height=300)
 
-        st.subheader("🔎 Baris FINON (Amount tanpa .00)")
-        st.dataframe(out_rows_display, use_container_width=True, height=380)
-
-        st.subheader("🗓️ Rekap Jumlah per Tanggal (Amount tanpa .00)")
-        st.dataframe(grouped_display, use_container_width=True, height=300)
-
-        # ===== Download: hapus .00 di file =====
         d1, d2 = st.columns(2)
         with d1:
-            st.download_button("💾 Unduh Baris FINON (CSV, tanpa .00)",
-                               data=_to_csv_bytes(out_rows_display),
-                               file_name="filtered_rows_finon.csv", mime="text/csv")
+            st.download_button("💾 Unduh Baris (CSV, tanpa .00 tampilan)",
+                               data=_to_csv_bytes(rows.assign(Amount=rows["Amount"].map(_fmt_no_dot00))),
+                               file_name="finon_rows_amount_from_neg10.csv", mime="text/csv")
         with d2:
-            st.download_button("💾 Unduh Rekap per Tanggal (CSV, tanpa .00)",
-                               data=_to_csv_bytes(grouped_display),
-                               file_name="grouped_by_date_finon.csv", mime="text/csv")
+            st.download_button("💾 Unduh Rekap (CSV, tanpa .00 tampilan)",
+                               data=_to_csv_bytes(grouped.assign(TotalAmount=grouped["TotalAmount"].map(_fmt_no_dot00))),
+                               file_name="finon_grouped_amount_from_neg10.csv", mime="text/csv")
 
         if show_debug:
             st.divider()
             st.markdown("**Debug**")
-            st.write("Detected columns:", cols)
-            st.write("Dtypes internal (Amount numeric):")
-            st.write(out_rows.dtypes)
-            st.dataframe(df_raw.head(30), use_container_width=True, height=260)
+            st.write("Nama kolom yang dipakai sebagai Credit (index -10):", _get_credit_col_by_neg10(df_raw))
+            st.dataframe(qsample, use_container_width=True)
 
+    except ValueError as e:
+        st.error(str(e))
+        st.write("Daftar kolom:", list(df_raw.columns) if 'df_raw' in locals() else "—")
     except ImportError as e:
         st.error(f"Gagal memproses file: {e}")
         st.info("Install dependency sesuai tipe file:")
@@ -237,4 +263,4 @@ if uploaded is not None:
 else:
     st.info("Unggah file untuk mulai memproses.")
 
-st.caption("Kolom Credit diubah menjadi 'Amount'. Tampilan & ekspor menghilangkan akhiran '.00'.")
+st.caption("Kolom Amount selalu diambil dari kolom ke-10 dari belakang. UI menampilkan tanpa '.00'; perhitungan tetap numeric.")
